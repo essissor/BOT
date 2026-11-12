@@ -1,0 +1,252 @@
+const WebSocket = require('ws');
+const fetch = require('node-fetch');
+const http = require('http');
+
+// --- CONFIGURATION VIA ENVIRONMENT VARIABLES (Set in Cloud Dashboard) ---
+const API_KEY = process.env.DELTA_API_KEY || "";
+const API_SECRET = process.env.DELTA_API_SECRET || "";
+const TRADE_UNITS = parseInt(process.env.TRADE_UNITS || "10", 10);
+const LEVERAGE = parseFloat(process.env.LEVERAGE || "50");
+const TAKE_PROFIT_PCT = parseFloat(process.env.TAKE_PROFIT_PCT || "0.60");
+const STOP_LOSS_PCT = parseFloat(process.env.STOP_LOSS_PCT || "0.30");
+
+const REST_URL = "https://api.india.delta.exchange";
+const WS_URL = "wss://socket.india.delta.exchange";
+
+let state = {
+  currentPrice: 0,
+  positionType: "NONE",
+  entryPrice: 0,
+  productId: 27, // BTCUSD
+  samples: [],
+  lastSampleTime: 0,
+  cooldownUntil: 0,
+  breakevenLocked: false,
+  signal: "WAIT"
+};
+
+function log(msg) {
+  const time = new Date().toISOString();
+  console.log(`[${time}] ${msg}`);
+}
+
+// --- HMAC-SHA256 SIGNATURE GENERATION ---
+async function generateSignature(secret, message) {
+  const crypto = require('crypto');
+  return crypto.createHmac('sha256', secret).update(message).digest('hex');
+}
+
+async function apiCall(method, path, body = "") {
+  if (!API_KEY || !API_SECRET) {
+    log("?? API Key or Secret missing in environment variables!");
+    return null;
+  }
+  const timestamp = Math.floor(Date.now() / 1000).toString();
+  const message = method + timestamp + path + body;
+  const signature = await generateSignature(API_SECRET, message);
+
+  try {
+    const response = await fetch(REST_URL + path, {
+      method: method,
+      headers: {
+        "Content-Type": "application/json",
+        "api-key": API_KEY,
+        "timestamp": timestamp,
+        "signature": signature
+      },
+      body: body ? body : null
+    });
+    return await response.json();
+  } catch (err) {
+    log(`API Error (${path}): ${err.message}`);
+    return null;
+  }
+}
+
+// --- WEBSOCKET FEED ---
+function startWebSocket() {
+  const ws = new WebSocket(WS_URL);
+
+  ws.on('open', () => {
+    log("Connected to Delta India Live WebSocket.");
+    ws.send(JSON.stringify({
+      type: "subscribe",
+      payload: { channels: [{ name: "v2/ticker", symbols: ["BTCUSD"] }] }
+    }));
+  });
+
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data);
+      if (msg.type === "v2/ticker" && msg.symbol === "BTCUSD") {
+        const price = parseFloat(msg.mark_price || msg.close);
+        if (!isNaN(price) && price > 0) {
+          state.currentPrice = price;
+          recordSample(price);
+        }
+      }
+    } catch (e) {}
+  });
+
+  ws.on('close', () => {
+    log("WebSocket disconnected. Reconnecting in 5 seconds...");
+    setTimeout(startWebSocket, 5000);
+  });
+
+  ws.on('error', (err) => {
+    log(`WebSocket error: ${err.message}`);
+  });
+}
+
+function recordSample(price) {
+  const now = Date.now();
+  if (now - state.lastSampleTime >= 3000) {
+    state.samples.push(price);
+    if (state.samples.length > 40) state.samples.shift();
+    state.lastSampleTime = now;
+  }
+}
+
+// --- TECHNICAL INDICATORS ---
+function calculateEMA(data, period) {
+  if (data.length < period) return null;
+  const k = 2 / (period + 1);
+  let ema = data.slice(0, period).reduce((a, b) => a + b, 0) / period;
+  for (let i = period; i < data.length; i++) {
+    ema = data[i] * k + ema * (1 - k);
+  }
+  return ema;
+}
+
+function calculateRSI(data, period = 14) {
+  if (data.length <= period) return null;
+  let gains = 0, losses = 0;
+  for (let i = data.length - period; i < data.length; i++) {
+    const diff = data[i] - data[i - 1];
+    if (diff >= 0) gains += diff;
+    else losses -= diff;
+  }
+  if (losses === 0) return 100;
+  const rs = (gains / period) / (losses / period);
+  return 100 - (100 / (1 + rs));
+}
+
+function evaluateConfluence() {
+  if (state.samples.length < 22 || Date.now() < state.cooldownUntil) {
+    state.signal = "WAIT";
+    return;
+  }
+
+  const ema9 = calculateEMA(state.samples, 9);
+  const ema21 = calculateEMA(state.samples, 21);
+  const rsi = calculateRSI(state.samples, 14);
+  const emaDiff = ema9 - ema21;
+
+  if (emaDiff > 12 && state.currentPrice > ema9 && rsi >= 52 && rsi <= 68) {
+    state.signal = "LONG";
+  } else if (emaDiff < -12 && state.currentPrice < ema9 && rsi <= 48 && rsi >= 32) {
+    state.signal = "SHORT";
+  } else {
+    state.signal = "WAIT";
+  }
+}
+
+// --- ORDER EXECUTION & POSITION SYNC ---
+async function syncPosition() {
+  const pRes = await apiCall("GET", "/v2/positions/margined");
+  if (pRes && pRes.result) {
+    const pos = pRes.result.find(p => (p.product_symbol === "BTCUSD" || p.product_id === state.productId) && parseFloat(p.size) !== 0);
+    if (pos) {
+      const newType = parseFloat(pos.size) > 0 ? "LONG" : "SHORT";
+      if (state.positionType === "NONE") state.breakevenLocked = false;
+      state.positionType = newType;
+      state.entryPrice = parseFloat(pos.entry_price || state.currentPrice);
+    } else {
+      state.positionType = "NONE";
+      state.entryPrice = 0;
+      state.breakevenLocked = false;
+    }
+  }
+}
+
+async function placeOrder(side, sizeUnits) {
+  const payload = JSON.stringify({
+    product_id: state.productId,
+    size: parseInt(sizeUnits),
+    order_type: "market_order",
+    side: side
+  });
+  const res = await apiCall("POST", "/v2/orders", payload);
+  if (res && res.success) {
+    log(`? ORDER FILLED: ${side.toUpperCase()} ${sizeUnits} BTCUSD @ ~$${state.currentPrice}`);
+    return true;
+  } else {
+    log(`?? ORDER REJECTED: ${JSON.stringify(res?.error || res)}`);
+    return false;
+  }
+}
+
+// --- MAIN TRADING LOOP ---
+async function mainLoop() {
+  try {
+    await syncPosition();
+    evaluateConfluence();
+
+    if (state.positionType !== "NONE" && state.entryPrice > 0 && state.currentPrice > 0) {
+      let diff = state.currentPrice - state.entryPrice;
+      if (state.positionType === "SHORT") diff = -diff;
+
+      const priceMovePct = (diff / state.entryPrice) * 100;
+      const unrealizedRoi = priceMovePct * LEVERAGE;
+
+      // Auto-breakeven trigger at 50% of TP target
+      if (!state.breakevenLocked && priceMovePct >= TAKE_PROFIT_PCT * 0.5) {
+        state.breakevenLocked = true;
+        log(`??? Breakeven locked for active ${state.positionType} position.`);
+      }
+
+      const closeSide = state.positionType === "LONG" ? "sell" : "buy";
+      const slPrice = state.positionType === "LONG" 
+        ? (state.breakevenLocked ? state.entryPrice * 1.0003 : state.entryPrice * (1 - STOP_LOSS_PCT / 100))
+        : (state.breakevenLocked ? state.entryPrice * 0.9997 : state.entryPrice * (1 + STOP_LOSS_PCT / 100));
+
+      const hitSL = state.positionType === "LONG" ? state.currentPrice <= slPrice : state.currentPrice >= slPrice;
+
+      if (priceMovePct >= TAKE_PROFIT_PCT) {
+        log(`?? TAKE-PROFIT REACHED (+${unrealizedRoi.toFixed(1)}% ROI). Closing position.`);
+        if (await placeOrder(closeSide, TRADE_UNITS)) {
+          state.positionType = "NONE";
+          state.cooldownUntil = Date.now() + 15000;
+        }
+      } else if (hitSL) {
+        log(`?? STOP-LOSS / BREAKEVEN HIT. Closing position.`);
+        if (await placeOrder(closeSide, TRADE_UNITS)) {
+          state.positionType = "NONE";
+          state.cooldownUntil = Date.now() + 30000;
+        }
+      }
+    } else if (state.positionType === "NONE" && state.currentPrice > 0) {
+      if (state.signal === "LONG") {
+        log(`?? Signal LONG confirmed @ $${state.currentPrice}. Executing...`);
+        await placeOrder("buy", TRADE_UNITS);
+      } else if (state.signal === "SHORT") {
+        log(`?? Signal SHORT confirmed @ $${state.currentPrice}. Executing...`);
+        await placeOrder("sell", TRADE_UNITS);
+      }
+    }
+  } catch (err) {
+    log(`Main loop error: ${err.message}`);
+  }
+}
+
+// --- MINI HTTP SERVER FOR CLOUD KEEP-ALIVE ---
+const server = http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain' });
+  res.end(`Delta India Scalper Bot is running 24/7! Current BTCUSD: $${state.currentPrice}\n`);
+});
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  log(`Keep-alive server listening on port ${PORT}`);
+  startWebSocket();
+  setInterval(mainLoop, 2000);
+});
