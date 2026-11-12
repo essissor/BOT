@@ -1,0 +1,56 @@
+name: Keep DeltaIndBot Open 24x7
+
+on:
+  schedule:
+    - cron: '0 */6 * * *' # Starts a fresh session every 6 hours
+  workflow_dispatch:       # Lets you start it manually anytime
+
+permissions:
+  contents: write          # Needed for the 60-day keepalive commit
+
+jobs:
+  keep-alive-browser:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # Runs for 5 hours 55 minutes, then hands off
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Keep workflow active past 60 days
+        uses: gautamkrishnar/keepalive-workflow@v2
+
+      - name: Install Playwright & Chromium
+        run: |
+          npm init -y
+          npm install playwright
+          npx playwright install chromium
+
+      - name: Open Webpage and Hold Session
+        run: |
+          node -e '
+          const { chromium } = require("playwright");
+          (async () => {
+            const browser = await chromium.launch({ headless: true });
+            const context = await browser.newContext({
+              userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            });
+            const page = await context.newPage();
+
+            page.on("console", msg => console.log("PAGE LOG:", msg.text()));
+            page.on("pageerror", err => console.log("PAGE ERROR:", err.message));
+
+            console.log("Opening https://deltaindbot.blogspot.com/ ...");
+            await page.goto("https://deltaindbot.blogspot.com/", {
+              waitUntil: "networkidle",
+              timeout: 60000
+            });
+            console.log("Page loaded. Holding tab open for 350 minutes...");
+
+            // Hold tab open for 5 hours 50 minutes
+            await new Promise(resolve => setTimeout(resolve, 350 * 60 * 1000));
+
+            await browser.close();
+            console.log("Session completed cleanly.");
+          })();
+          '
